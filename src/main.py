@@ -1,7 +1,11 @@
 import os
+import uuid
 
+from bedrock_agentcore.memory import MemoryClient
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from dotenv import load_dotenv
 from mcp_client.client import get_streamable_http_mcp_client
+from memory.client import CustomerSupportMemoryHooks, get_memory_config
 from model.load import load_model
 from strands import Agent
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
@@ -11,10 +15,13 @@ from tools.get_return_policy import get_return_policy
 from tools.get_technical_support import get_technical_support
 from tools.web_search import web_search
 
+# 加載 .env 文件（本地測試時使用）
+load_dotenv()
+
 app = BedrockAgentCoreApp()
 log = app.logger
 
-REGION = os.getenv("AWS_REGION")
+REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 
 # Import AgentCore Gateway as Streamable HTTP MCP Client
 mcp_client = get_streamable_http_mcp_client()
@@ -32,27 +39,59 @@ You have access to the following tools:
 2. get_product_info() - To get information about a specific product
 3. web_search() - Search the web for troubleshooting help
 
-Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
+Always use the appropriate tool to get accurate, up-to-date information rather than guessing.
+Always use traditional chinese to response"""
 
 
 @app.entrypoint
 async def invoke(payload, context):
-    session_id = getattr(context, "session_id", "default")
+    """
+    Main entrypoint for the customer support agent with memory capabilities.
+
+    This agent uses AgentCore Memory to:
+    - Remember customer preferences and history
+    - Provide personalized responses based on past interactions
+    - Automatically save new interactions for future context
+    """
+    session_id = getattr(context, "session_id", str(uuid.uuid4()))
+
+    # Get customer identifier from payload or context (default to session for demo)
+    customer_id = payload.get("customer_id", getattr(context, "actor_id", session_id))
 
     # Create code interpreter
     code_interpreter = AgentCoreCodeInterpreter(
         region=REGION, session_name=session_id, auto_create=True, persist_sessions=True
     )
 
+    # Initialize memory client and configuration
+    try:
+        memory_config = get_memory_config()
+        memory_client = MemoryClient(region_name=REGION)
+
+        # Create memory hooks for automatic context management
+        memory_hooks = CustomerSupportMemoryHooks(
+            memory_id=memory_config["memory_id"],
+            client=memory_client,
+            actor_id=customer_id,
+            session_id=session_id,
+        )
+        log.info(
+            f"Memory hooks initialized for customer {customer_id}, session {session_id}"
+        )
+    except ValueError as e:
+        log.warning(f"Memory not configured: {e}")
+        log.warning("Agent will run without memory capabilities")
+        memory_hooks = None
+
     with mcp_client as client:
         # Get MCP Tools
         tools = client.list_tools_sync()
 
-        # Create agent
-        agent = Agent(
-            model=load_model(),
-            system_prompt=system_prompt,
-            tools=[
+        # Create agent with memory hooks (if configured)
+        agent_kwargs = {
+            "model": load_model(),
+            "system_prompt": system_prompt,
+            "tools": [
                 code_interpreter.code_interpreter,
                 add_numbers,
                 get_return_policy,
@@ -61,7 +100,13 @@ async def invoke(payload, context):
                 get_technical_support,
             ]
             + tools,
-        )
+        }
+
+        # Add memory hooks if available
+        if memory_hooks:
+            agent_kwargs["hooks"] = [memory_hooks]
+
+        agent = Agent(**agent_kwargs)
 
         # Execute and format response
         stream = agent.stream_async(payload.get("prompt"))

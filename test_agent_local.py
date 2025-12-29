@@ -6,7 +6,12 @@
 """
 
 import asyncio
+import os
+import uuid
 
+from bedrock_agentcore.memory import MemoryClient
+from dotenv import load_dotenv
+from memory.client import CustomerSupportMemoryHooks, get_memory_config
 from model.load import load_model
 from strands import Agent
 from tools.add_numbers import add_numbers
@@ -14,6 +19,14 @@ from tools.get_product_info import get_product_info
 from tools.get_return_policy import get_return_policy
 from tools.get_technical_support import get_technical_support
 from tools.web_search import web_search
+
+# 加載 .env 文件
+load_dotenv()
+
+
+# 固定的測試客戶 ID - 確保跨 session 記憶
+REGION = os.getenv("AWS_REGION", "ap-northeast-1")
+TEST_CUSTOMER_ID = os.getenv("TEST_CUSTOMER_ID", "test_customer_001")
 
 # System prompt
 system_prompt = """You are a helpful and professional customer support assistant for an e-commerce company.
@@ -30,6 +43,67 @@ You have access to the following tools:
 4. get_technical_support() - For technical support issues
 
 Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
+
+
+def create_agent_with_memory():
+    """創建帶有 memory 功能的 Agent"""
+    import logging
+
+    # 啟用 memory client 的詳細日誌，但只顯示一次
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+
+    # 只啟用我們關心的 logger
+    logging.getLogger("memory.client").setLevel(logging.INFO)
+    logging.getLogger("bedrock_agentcore.memory").setLevel(logging.INFO)
+
+    # 禁用可能導致重複輸出的 logger
+    logging.getLogger("strands").setLevel(logging.WARNING)
+
+    # 基本 tools
+    tools = [
+        get_return_policy,
+        get_product_info,
+        web_search,
+        get_technical_support,
+        add_numbers,
+    ]
+
+    # 嘗試初始化 memory
+    memory_hooks = None
+    try:
+        memory_config = get_memory_config()
+        memory_client = MemoryClient(region_name=REGION)
+        session_id = str(uuid.uuid4())
+
+        memory_hooks = CustomerSupportMemoryHooks(
+            memory_id=memory_config["memory_id"],
+            client=memory_client,
+            actor_id=TEST_CUSTOMER_ID,
+            session_id=session_id,
+        )
+        print(f"✅ Memory 已啟用")
+        print(f"   Customer ID: {TEST_CUSTOMER_ID}")
+        print(f"   Memory ID: {memory_config['memory_id']}")
+        print(f"   Session ID: {session_id}")
+    except ValueError as e:
+        print(f"⚠️  Memory 未配置: {e}")
+        print("💡 Agent 將在沒有 memory 的情況下運行")
+    except Exception as e:
+        print(f"⚠️  Memory 初始化失敗: {e}")
+        print("💡 Agent 將在沒有 memory 的情況下運行")
+
+    # 創建 agent configuration
+    agent_kwargs = {
+        "model": load_model(),
+        "system_prompt": system_prompt,
+        "tools": tools,
+    }
+
+    # 如果 memory 可用，添加 hooks
+    if memory_hooks:
+        agent_kwargs["hooks"] = [memory_hooks]
+
+    return Agent(**agent_kwargs)
 
 
 def test_tools():
@@ -75,18 +149,8 @@ async def test_agent():
     print("🤖 測試 Agent 對話")
     print("=" * 80)
 
-    # 創建 Agent
-    agent = Agent(
-        model=load_model(),
-        system_prompt=system_prompt,
-        tools=[
-            get_return_policy,
-            get_product_info,
-            web_search,
-            get_technical_support,
-            add_numbers,
-        ],
-    )
+    # 創建 Agent (帶 memory)
+    agent = create_agent_with_memory()
 
     # 測試場景
     test_queries = [
@@ -113,16 +177,8 @@ async def test_agent_streaming():
     print("🌊 測試 Agent 串流回應")
     print("=" * 80)
 
-    agent = Agent(
-        model=load_model(),
-        system_prompt=system_prompt,
-        tools=[
-            get_return_policy,
-            get_product_info,
-            web_search,
-            get_technical_support,
-        ],
-    )
+    # 創建 Agent (帶 memory)
+    agent = create_agent_with_memory()
 
     query = "What's the return policy for laptops and tell me about MacBook Pro 14?"
     print(f"\n💬 Query: {query}")
@@ -142,18 +198,11 @@ def interactive_mode():
     print("\n" + "=" * 80)
     print("💬 互動模式 (輸入 'quit' 或 'exit' 結束)")
     print("=" * 80)
+    print()
 
-    agent = Agent(
-        model=load_model(),
-        system_prompt=system_prompt,
-        tools=[
-            get_return_policy,
-            get_product_info,
-            web_search,
-            get_technical_support,
-            add_numbers,
-        ],
-    )
+    # 創建 Agent (帶 memory)
+    agent = create_agent_with_memory()
+    print()
 
     while True:
         try:
@@ -168,7 +217,11 @@ def interactive_mode():
 
             print("🤖 Agent: ", end="", flush=True)
             response = agent(user_input)
-            print(response)
+            # 只打印文本内容，避免重复
+            if hasattr(response, 'text'):
+                print(response.text)
+            else:
+                print(str(response))
 
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
