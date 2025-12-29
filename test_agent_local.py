@@ -1,5 +1,5 @@
 """
-本地測試腳本 - 不需要部署到 AgentCore 即可測試 Agent 和工具
+本地測試腳本 - 測試 Agent 和工具（含 Gateway MCP 工具）
 
 使用方式:
     python test_agent_local.py
@@ -9,16 +9,19 @@ import asyncio
 import os
 import uuid
 
+import httpx
 from bedrock_agentcore.memory import MemoryClient
 from dotenv import load_dotenv
+from mcp.client.streamable_http import streamable_http_client
 from memory.client import CustomerSupportMemoryHooks, get_memory_config
 from model.load import load_model
 from strands import Agent
+from strands.tools.mcp import MCPClient
 from tools.add_numbers import add_numbers
 from tools.get_product_info import get_product_info
 from tools.get_return_policy import get_return_policy
 from tools.get_technical_support import get_technical_support
-from tools.web_search import web_search
+from utils.aws_helpers import get_or_create_cognito_pool, get_ssm_parameter
 
 # 加載 .env 文件
 load_dotenv()
@@ -36,44 +39,94 @@ Your role is to:
 - Always offer additional help after answering questions
 - If you can't help with something, direct customers to the appropriate contact
 
-You have access to the following tools:
-1. get_return_policy() - For return policy questions
-2. get_product_info() - To get information about a specific product
-3. web_search() - Search the web for troubleshooting help
-4. get_technical_support() - For technical support issues
+You have access to tools for:
+- Product information and return policies
+- Warranty status checking
+- Technical support and troubleshooting
+- Web search for latest information
 
-Always use the appropriate tool to get accurate, up-to-date information rather than guessing."""
+When a customer asks about warranty status, use the warranty checking tool.
+When a customer needs troubleshooting help, you can search the web for solutions.
+Always use the appropriate tool to get accurate, up-to-date information rather than guessing.
+Always use traditional chinese to response"""
+
+
+def get_gateway_mcp_client():
+    """Get MCP client for AgentCore Gateway."""
+    try:
+        # Get Gateway URL from SSM
+        gateway_url = get_ssm_parameter("/app/customersupport/agentcore/gateway_url")
+
+        if not gateway_url:
+            print("⚠️  Gateway URL not found in SSM")
+            print("   Run: python scripts/setup_gateway.py")
+            return None
+
+        # Create transport callable that gets fresh token each time
+        def create_transport():
+            # Get fresh Cognito authentication token
+            cognito_config = get_or_create_cognito_pool(refresh_token=True)
+            bearer_token = cognito_config["bearer_token"]
+
+            # Create httpx client with authentication headers
+            http_client = httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                timeout=30.0,
+            )
+
+            return streamable_http_client(gateway_url, http_client=http_client)
+
+        # Create MCP client with authenticated HTTP client
+        mcp_client = MCPClient(create_transport)
+
+        print("✅ Gateway MCP client created")
+        return mcp_client
+
+    except Exception as e:
+        print(f"⚠️  Failed to create Gateway client: {e}")
+        print("   Agent will run with local tools only")
+        return None
 
 
 def create_agent_with_memory():
-    """創建帶有 memory 功能的 Agent"""
+    """創建帶有 memory 功能的 Agent（含 Gateway MCP 工具）"""
     import logging
 
-    # 啟用 memory client 的詳細日誌，但只顯示一次
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
-
-    # 只啟用我們關心的 logger
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     logging.getLogger("memory.client").setLevel(logging.INFO)
     logging.getLogger("bedrock_agentcore.memory").setLevel(logging.INFO)
-
-    # 禁用可能導致重複輸出的 logger
     logging.getLogger("strands").setLevel(logging.WARNING)
 
-    # 基本 tools
-    tools = [
+    # Define local tools
+    local_tools = [
+        add_numbers,
         get_return_policy,
         get_product_info,
-        web_search,
         get_technical_support,
-        add_numbers,
     ]
 
-    # 嘗試初始化 memory
+    # Get Gateway MCP client
+    print("\n🌐 Connecting to AgentCore Gateway...")
+    mcp_client = get_gateway_mcp_client()
+
+    # Return mcp_client without closing it - caller will manage context
+    # Gateway tools will be added when MCP client context is active
+
+    print(f"\n📊 Agent Configuration:")
+    print(f"   Total tools: {len(local_tools)} local tools")
+    if mcp_client:
+        print(f"   Gateway MCP client: Ready ✅")
+        print(f"   (Gateway tools will be loaded in MCP context)")
+    else:
+        print(f"   Gateway MCP client: Not available ⚠️")
+
+    # Initialize Memory
     memory_hooks = None
+    session_id = str(uuid.uuid4())
+
     try:
         memory_config = get_memory_config()
         memory_client = MemoryClient(region_name=REGION)
-        session_id = str(uuid.uuid4())
 
         memory_hooks = CustomerSupportMemoryHooks(
             memory_id=memory_config["memory_id"],
@@ -81,182 +134,299 @@ def create_agent_with_memory():
             actor_id=TEST_CUSTOMER_ID,
             session_id=session_id,
         )
-        print(f"✅ Memory 已啟用")
-        print(f"   Customer ID: {TEST_CUSTOMER_ID}")
-        print(f"   Memory ID: {memory_config['memory_id']}")
-        print(f"   Session ID: {session_id}")
+        print("   Memory: Enabled ✅")
+        print(f"   - Customer ID: {TEST_CUSTOMER_ID}")
+        print(f"   - Memory ID: {memory_config['memory_id']}")
+        print(f"   - Session ID: {session_id}")
     except ValueError as e:
-        print(f"⚠️  Memory 未配置: {e}")
-        print("💡 Agent 將在沒有 memory 的情況下運行")
+        print(f"   Memory: Disabled ⚠️ ({e})")
     except Exception as e:
-        print(f"⚠️  Memory 初始化失敗: {e}")
-        print("💡 Agent 將在沒有 memory 的情況下運行")
+        print(f"   Memory: Error ❌ ({e})")
 
-    # 創建 agent configuration
+    # Create agent with local tools only
+    # Gateway tools will be added dynamically in MCP client context
     agent_kwargs = {
         "model": load_model(),
         "system_prompt": system_prompt,
-        "tools": tools,
+        "tools": local_tools,
     }
 
-    # 如果 memory 可用，添加 hooks
     if memory_hooks:
         agent_kwargs["hooks"] = [memory_hooks]
 
-    return Agent(**agent_kwargs)
+    agent = Agent(**agent_kwargs)
+
+    return agent, session_id, mcp_client, local_tools
 
 
 def test_tools():
-    """測試所有工具函式是否正常運作"""
-    print("=" * 80)
-    print("🧪 測試工具函式")
+    """測試本地工具函式"""
+    print("\n" + "=" * 80)
+    print("🧪 測試 1: 本地工具函式")
     print("=" * 80)
 
     # Test 1: get_return_policy
-    print("\n📋 Test 1: get_return_policy('smartphones')")
+    print("\n📋 Test 1.1: get_return_policy('smartphones')")
     print("-" * 80)
     result = get_return_policy("smartphones")
     print(result)
 
     # Test 2: get_product_info
-    print("\n📦 Test 2: get_product_info('Samsung Galaxy S22')")
+    print("\n📦 Test 1.2: get_product_info('Samsung Galaxy S22')")
     print("-" * 80)
     result = get_product_info("Samsung Galaxy S22")
     print(result)
 
-    # Test 3: web_search
-    print("\n🔍 Test 3: web_search('iphone 14 battery life')")
-    print("-" * 80)
-    result = web_search("iphone 14 battery life")
-    print(result)
-
-    # Test 4: get_technical_support
-    print("\n🔧 Test 4: get_technical_support('phone won\\'t turn on')")
+    # Test 3: get_technical_support
+    print("\n🔧 Test 1.3: get_technical_support('phone won\\'t turn on')")
     print("-" * 80)
     result = get_technical_support("phone won't turn on")
     print(result)
 
-    # Test 5: add_numbers
-    print("\n🔢 Test 5: add_numbers(123, 456)")
+    # Test 4: add_numbers
+    print("\n🔢 Test 1.4: add_numbers(123, 456)")
     print("-" * 80)
     result = add_numbers(123, 456)
     print(f"Result: {result}")
 
+    print("\n🌐 Gateway MCP Tools (check_warranty_status, web_search)")
+    print("-" * 80)
+    print("These tools are loaded from AgentCore Gateway at runtime.")
+    print("Test them in interactive mode with:")
+    print("  - 'Check warranty for serial MNO33333333'")
+    print("  - 'Search web for iPhone 14 battery tips'")
 
-async def test_agent():
-    """測試 Agent 完整對話流程"""
+
+def test_agent_with_memory():
+    """測試 Agent 對話（with Memory & Gateway tools）"""
     print("\n" + "=" * 80)
-    print("🤖 測試 Agent 對話")
+    print("🧠 測試 2: Agent 對話 (with Memory & Gateway tools)")
     print("=" * 80)
 
-    # 創建 Agent (帶 memory)
-    agent = create_agent_with_memory()
+    agent, _session_id, mcp_client, local_tools = create_agent_with_memory()
 
-    # 測試場景
-    test_queries = [
-        "What's the return policy for my Samsung Galaxy S22?",
-        "Tell me about the iPhone 14",
-        "My phone won't turn on, what should I do?",
-        "Calculate 123 + 456",
+    test_prompts = [
+        "我想了解 iPhone 14 的退貨政策",
+        "幫我查詢保固狀態，序號是 MNO33333333",  # Gateway MCP tool
+        "搜尋一下 MacBook Pro 過熱的解決方案",  # Gateway MCP tool
     ]
 
-    for i, query in enumerate(test_queries, 1):
-        print(f"\n💬 Test Query {i}:")
-        print(f"Customer: {query}")
-        print("-" * 80)
+    # Use MCP client context if available
+    if mcp_client:
+        with mcp_client:
+            # Load Gateway tools within context
+            try:
+                gateway_tools = mcp_client.list_tools_sync()
+                all_tools = local_tools + gateway_tools
+                agent.tools = all_tools
+                print(f"\n✅ Loaded {len(gateway_tools)} Gateway tools")
+            except Exception as e:
+                print(f"\n⚠️  Failed to load Gateway tools: {e}")
 
-        # 同步調用
-        response = agent(query)
-        print(f"Agent: {response}")
-        print()
+            for i, prompt in enumerate(test_prompts, 1):
+                print(f"\n📝 Test 2.{i}: {prompt}")
+                print("-" * 80)
+                try:
+                    response = agent(prompt)
+                    print(f"🤖 Response: {response}")
+                except Exception as e:
+                    print(f"❌ Error: {e}")
+    else:
+        # No MCP client, run without Gateway tools
+        for i, prompt in enumerate(test_prompts, 1):
+            print(f"\n📝 Test 2.{i}: {prompt}")
+            print("-" * 80)
+            try:
+                response = agent(prompt)
+                print(f"🤖 Response: {response}")
+            except Exception as e:
+                print(f"❌ Error: {e}")
 
 
 async def test_agent_streaming():
-    """測試 Agent 串流回應"""
+    """測試 Agent 串流回應（with Memory & Gateway tools）"""
     print("\n" + "=" * 80)
-    print("🌊 測試 Agent 串流回應")
+    print("📡 測試 3: Agent 串流回應 (with Memory & Gateway tools)")
     print("=" * 80)
 
-    # 創建 Agent (帶 memory)
-    agent = create_agent_with_memory()
+    agent, _session_id, mcp_client, local_tools = create_agent_with_memory()
 
-    query = "What's the return policy for laptops and tell me about MacBook Pro 14?"
-    print(f"\n💬 Query: {query}")
+    prompt = "幫我查保固狀態，序號 MNO33333333，並搜尋這個產品的使用評價"
+
+    print(f"\n📝 Prompt: {prompt}")
     print("-" * 80)
-    print("Agent (streaming): ", end="", flush=True)
+    print("🤖 Response (streaming):")
 
-    # 異步串流
-    async for chunk in agent.stream_async(query):
-        if "data" in chunk and isinstance(chunk["data"], str):
-            print(chunk["data"], end="", flush=True)
+    try:
+        if mcp_client:
+            with mcp_client:
+                # Load Gateway tools within context
+                try:
+                    gateway_tools = mcp_client.list_tools_sync()
+                    all_tools = local_tools + gateway_tools
+                    agent.tools = all_tools
+                    print(f"\n✅ Loaded {len(gateway_tools)} Gateway tools\n")
+                except Exception as e:
+                    print(f"\n⚠️  Failed to load Gateway tools: {e}\n")
 
-    print("\n")
+                stream = agent.stream_async(prompt)
+                async for chunk in stream:
+                    if "data" in chunk and isinstance(chunk["data"], str):
+                        print(chunk["data"], end="", flush=True)
+                print()  # New line after streaming
+        else:
+            stream = agent.stream_async(prompt)
+            async for chunk in stream:
+                if "data" in chunk and isinstance(chunk["data"], str):
+                    print(chunk["data"], end="", flush=True)
+            print()  # New line after streaming
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
 
 
-def interactive_mode():
-    """互動模式 - 可以與 Agent 對話"""
+async def interactive_mode():
+    """互動模式 - 可以持續與 Agent 對話（含 Gateway tools）"""
     print("\n" + "=" * 80)
-    print("💬 互動模式 (輸入 'quit' 或 'exit' 結束)")
+    print("💬 互動模式 - 與 Agent 對話")
     print("=" * 80)
-    print()
+    print("輸入 'quit' 或 'exit' 離開\n")
 
-    # 創建 Agent (帶 memory)
-    agent = create_agent_with_memory()
-    print()
+    # Get MCP client and local tools (don't create agent yet)
+    _, session_id, mcp_client, local_tools = create_agent_with_memory()
+    print("-" * 80)
 
-    while True:
-        try:
-            user_input = input("\n🧑 You: ").strip()
+    # Setup memory hooks
+    memory_hooks = None
+    try:
+        memory_config = get_memory_config()
+        memory_client = MemoryClient(region_name=REGION)
+        memory_hooks = CustomerSupportMemoryHooks(
+            memory_id=memory_config["memory_id"],
+            client=memory_client,
+            actor_id=TEST_CUSTOMER_ID,
+            session_id=session_id,
+        )
+    except Exception:
+        pass  # Already logged in create_agent_with_memory
 
-            if user_input.lower() in ["quit", "exit", "q"]:
-                print("👋 Goodbye!")
+    conversation_count = 0
+
+    # Interactive loop function
+    async def run_interactive_loop(agent):
+        """Run the interactive loop with the agent."""
+        nonlocal conversation_count
+
+        while True:
+            try:
+                user_input = input("\n👤 你: ").strip()
+
+                if user_input.lower() in ["quit", "exit", "bye"]:
+                    print("\n👋 再見！")
+                    break
+
+                if not user_input:
+                    continue
+
+                conversation_count += 1
+                print(f"\n🤖 Agent (#{conversation_count}):")
+                print("-" * 80)
+
+                try:
+                    # Use streaming for better UX
+                    stream = agent.stream_async(user_input)
+                    async for _ in stream:
+                        pass
+                    print()  # New line after streaming
+                except Exception as e:
+                    print(f"❌ Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            except KeyboardInterrupt:
+                print("\n\n👋 再見！")
+                break
+            except EOFError:
+                print("\n\n👋 再見！")
                 break
 
-            if not user_input:
-                continue
+    # Create and run agent within MCP context (following Jupyter notebook pattern)
+    if mcp_client:
+        with mcp_client:
+            # Load Gateway tools within MCP context
+            try:
+                gateway_tools = mcp_client.list_tools_sync()
+                all_tools = local_tools + gateway_tools
+                print(f"\n✅ Loaded {len(gateway_tools)} Gateway tools")
+                for tool in gateway_tools:
+                    print(f"   - {tool.tool_name}")
+                print(
+                    f"   Total tools: {len(all_tools)} ({len(local_tools)} local + {len(gateway_tools)} gateway)"
+                )
+            except Exception as e:
+                print(f"\n⚠️  Failed to load Gateway tools: {e}")
+                print(f"   Using {len(local_tools)} local tools only")
+                all_tools = local_tools
+                import traceback
+                traceback.print_exc()
 
-            print("🤖 Agent: ", end="", flush=True)
-            response = agent(user_input)
-            # 只打印文本内容，避免重复
-            if hasattr(response, 'text'):
-                print(response.text)
-            else:
-                print(str(response))
+            # Create agent INSIDE MCP context with all tools (key fix!)
+            agent_kwargs = {
+                "model": load_model(),
+                "system_prompt": system_prompt,
+                "tools": all_tools,  # ← Tools included at creation time
+            }
+            if memory_hooks:
+                agent_kwargs["hooks"] = [memory_hooks]
 
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
-            break
-        except Exception as e:
-            print(f"\n❌ Error: {e}")
+            agent = Agent(**agent_kwargs)
+            print("\n✅ Agent created with all tools inside MCP context")
+
+            # Run interactive loop while in MCP context
+            await run_interactive_loop(agent)
+    else:
+        # No MCP client - create agent with local tools only
+        print(f"\n   Using {len(local_tools)} local tools only")
+        agent_kwargs = {
+            "model": load_model(),
+            "system_prompt": system_prompt,
+            "tools": local_tools,
+        }
+        if memory_hooks:
+            agent_kwargs["hooks"] = [memory_hooks]
+
+        agent = Agent(**agent_kwargs)
+        await run_interactive_loop(agent)
 
 
 def main():
-    """主測試流程"""
-    print("\n🎯 AgentCore Customer Support Agent - 本地測試")
+    """主選單"""
+    print("\n" + "=" * 80)
+    print("🎯 AgentCore Customer Support Agent - 本地測試")
     print("=" * 80)
-
-    # 選擇測試模式
-    print("\n選擇測試模式:")
-    print("1. 測試工具函式")
-    print("2. 測試 Agent 對話")
-    print("3. 測試 Agent 串流回應")
+    print("\n選擇測試模式:\n")
+    print("1. 測試工具函式（本地工具）")
+    print("2. 測試 Agent 對話 (with Memory & Gateway tools)")
+    print("3. 測試 Agent 串流回應 (with Memory & Gateway tools)")
     print("4. 互動模式 (與 Agent 對話)")
-    print("5. 執行所有測試")
+    print("5. 執行所有測試\n")
 
-    choice = input("\n請選擇 (1-5): ").strip()
+    choice = input("請選擇 (1-5): ").strip()
 
     if choice == "1":
         test_tools()
     elif choice == "2":
-        asyncio.run(test_agent())
+        test_agent_with_memory()
     elif choice == "3":
         asyncio.run(test_agent_streaming())
     elif choice == "4":
-        interactive_mode()
+        asyncio.run(interactive_mode())
     elif choice == "5":
         test_tools()
-        asyncio.run(test_agent())
+        test_agent_with_memory()
         asyncio.run(test_agent_streaming())
+        print("\n所有自動測試完成！按 Enter 進入互動模式...")
+        input()
+        asyncio.run(interactive_mode())
     else:
         print("❌ 無效的選擇")
 

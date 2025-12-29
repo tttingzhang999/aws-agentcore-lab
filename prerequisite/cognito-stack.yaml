@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito User Pool for AgentCore Gateway Authentication (Machine-to-Machine)'
+
+Parameters:
+  UserPoolName:
+    Type: String
+    Default: 'CustomerSupportGatewayPool'
+    Description: 'Name of the Cognito User Pool'
+
+  MachineAppClientName:
+    Type: String
+    Default: 'CustomerSupportMachineClient'
+    Description: 'Name of the Cognito User Pool Machine Client'
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref UserPoolName
+      MfaConfiguration: 'OFF'
+
+  MachineUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: !Ref MachineAppClientName
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+      RefreshTokenValidity: 1
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub 'customersupport-resource-server-${AWS::StackName}/read'
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+      EnableTokenRevocation: true
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub 'customersupport-resource-server-${AWS::StackName}'
+      Name: !Sub 'Customer Support Resource Server'
+      Scopes:
+        - ScopeName: 'read'
+          ScopeDescription: 'Read access to customer support tools'
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub 'customersupport-${AWS::AccountId}'
+
+  # SSM Parameters
+  CognitoClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/machine_client_id
+      Type: String
+      Value: !Ref MachineUserPoolClient
+      Description: Machine Cognito client ID
+
+  CognitoClientSecretParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/machine_client_secret
+      Type: String
+      Value: !GetAtt MachineUserPoolClientSecret.ClientSecret
+      Description: Machine Cognito client secret (SecureString)
+
+  UserPoolIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/cognito_user_pool_id
+      Type: String
+      Value: !Ref UserPool
+      Description: Cognito User Pool ID
+
+  CognitoDiscoveryURLParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/cognito_discovery_url
+      Type: String
+      Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+      Description: OAuth2 Discovery URL
+
+  CognitoTokenURLParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/cognito_token_url
+      Type: String
+      Value: !Sub 'https://customersupport-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+      Description: OAuth2 Token URL
+
+  CognitoDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/cognito_domain
+      Type: String
+      Value: !Sub 'https://customersupport-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+      Description: Cognito hosted domain for OAuth2
+
+  CognitoAuthScopeParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app/customersupport/agentcore/cognito_auth_scope
+      Type: String
+      Value: !Sub 'customersupport-resource-server-${AWS::StackName}/read'
+      Description: OAuth2 scope for Gateway authentication
+
+  # Custom resource to get client secret
+  MachineUserPoolClientSecret:
+    Type: Custom::CognitoClientSecret
+    Properties:
+      ServiceToken: !GetAtt GetClientSecretFunction.Arn
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref MachineUserPoolClient
+
+  GetClientSecretFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+
+  GetClientSecretFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt GetClientSecretFunctionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  user_pool_id = event['ResourceProperties']['UserPoolId']
+                  client_id = event['ResourceProperties']['ClientId']
+
+                  cognito = boto3.client('cognito-idp')
+                  response = cognito.describe_user_pool_client(
+                      UserPoolId=user_pool_id,
+                      ClientId=client_id
+                  )
+
+                  client_secret = response['UserPoolClient'].get('ClientSecret', '')
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ClientSecret': client_secret
+                  })
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  MachineClientId:
+    Description: Machine Client ID
+    Value: !Ref MachineUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-MachineClientId'
+
+  CognitoDomain:
+    Description: Cognito Domain
+    Value: !Sub 'https://customersupport-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-Domain'
+
+  TokenEndpoint:
+    Description: OAuth2 Token Endpoint
+    Value: !Sub 'https://customersupport-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+    Export:
+      Name: !Sub '${AWS::StackName}-TokenEndpoint'
