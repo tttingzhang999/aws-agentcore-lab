@@ -1,0 +1,37 @@
+root = true
+
+# Default settings for all files
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# Python specific settings
+[*.py]
+indent_size = 4
+
+# Markdown specific settings
+[*.md]
+indent_size = 2
+
+# Markdown often uses trailing spaces for line breaks
+trim_trailing_whitespace = false
+
+# Terraform specific settings
+[*.tf]
+indent_style = space
+indent_size = 2
+
+# Specific rules for TOML files
+[*.toml]
+indent_style = space
+indent_size = 2
+
+# YAML specific settings
+[*.yml]
+indent_size = 2
+
+[*.yaml]
+indent_size = 2
